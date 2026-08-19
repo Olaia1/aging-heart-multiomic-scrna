@@ -1,0 +1,2009 @@
+```         
+# 1. Install devtools if not already available
+if (!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+
+# 2. Install nichenetr from GitHub
+devtools::install_github("saeyslab/nichenetr")
+```
+
+```         
+# Switch download method (useful on Windows if the default method fails)
+options(download.file.method = "wininet")
+
+# Retry the multinichenetr installation
+remotes::install_github("saeyslab/multinichenetr")
+```
+
+`# Install devtools if not already installed`
+
+`if (!requireNamespace("devtools", quietly = TRUE))`
+
+`install.packages("devtools")`
+
+`# Install BiocManager if needed`
+
+`if (!requireNamespace("BiocManager", quietly = TRUE))`
+
+`install.packages("BiocManager")`
+
+`# Install Bioconductor dependencies`
+
+`BiocManager::install("ComplexHeatmap")`
+
+`# Install CRAN packages needed alongside nichenetr`
+
+`install.packages(c("tidyverse", "circlize", "ggrepel", "igraph", "ggraph"))`
+
+`# Install nichenetr from GitHub (use the saeyslab fork — the actively maintained version)`
+
+`devtools::install_github("saeyslab/nichenetr")`
+
+# MultiNicheNet x WGCNA Integration
+
+```{r libraries-integration}
+library(reticulate)
+library(Seurat)
+library(SingleCellExperiment)
+library(nichenetr)
+library(multinichenetr)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+py_require(c("anndata"))
+ad <- import("anndata")
+
+
+# Used further below for the circos plot. GO enrichment itself is NOT
+# recomputed here -- it's reused directly from the go_full_module_df /
+# go_hubs_df objects already computed in WGCNA_24_hdwgcna_HVG.Rmd (same R session).
+if (!requireNamespace("circlize", quietly = TRUE)) install.packages("circlize")
+if (!requireNamespace("openxlsx", quietly = TRUE)) install.packages("openxlsx")
+if (!requireNamespace("visNetwork", quietly = TRUE)) install.packages("visNetwork")
+if (!requireNamespace("igraph", quietly = TRUE)) install.packages("igraph")
+if (!requireNamespace("ggraph", quietly = TRUE)) install.packages("ggraph")
+library(circlize)
+library(openxlsx)
+library(visNetwork)
+library(igraph)
+```
+
+```{r}
+select <- dplyr::select
+# o, más robusto si usas conflictos frecuentes:
+library(conflicted)
+conflicts_prefer(dplyr::select, dplyr::filter, dplyr::mutate)
+```
+
+## Step 0: Build the SingleCellExperiment (SCE) input for MultiNicheNet
+
+No `.h5ad` reload, no re-mapping of `cell_ontology_class`, no re-QC: `seurat_combined_filt`, `meta` (with `meta$final_celltype` already collapsed AND restricted to `target_celltypes`) and `keep_cells` are taken exactly as they exist at the end of `WGCNA_24_hdwgcna_HVG.Rmd`. This guarantees MultiNicheNet analyzes the identical cells, the identical cell type definitions, and the identical cell type restriction that WGCNA used for its pseudobulk network -- there is no risk of the two analyses silently drifting apart.
+
+`colData(sce)` is still built explicitly (instead of relying on `Seurat::as.SingleCellExperiment()`), because that automatic conversion was found to silently drop most metadata columns in this project (only 3 columns were carried over instead of the expected 26). Building `colData` directly from `seurat_mnn@meta.data`, aligned by cell name, guarantees every column -- including `sex` and `tech` -- ends up in the SCE.
+
+```{r}
+heart_facs    <- ad$read_h5ad("D:/SandraAnjo/Luis Grilo/WGCNAandothersOlaia/data/Heart_facs.h5ad")
+heart_droplet <-ad$read_h5ad("D:/SandraAnjo/Luis Grilo/WGCNAandothersOlaia/data/Heart_droplet.h5ad")
+
+# var_names is already the gene symbol
+facs_genes    <- rownames(py_to_r(heart_facs$var))
+droplet_genes <- rownames(py_to_r(heart_droplet$var))
+shared_genes  <- intersect(facs_genes, droplet_genes)
+cat("Shared genes:", length(shared_genes), "\n")
+
+combined_heart <- ad$concat(
+  list(heart_droplet, heart_facs),
+  axis = 0L,
+  join = "outer",
+  keys = c("droplet", "facs"),
+  label = "tech",
+  index_unique = "-"
+)
+combined_genes <- py_to_r(combined_heart$var_names$values)
+combined_cells <- py_to_r(combined_heart$obs_names$values)
+
+cat("Combined genes:", length(combined_genes), "\n")
+cat("Combined cells:", length(combined_cells), "\n")
+
+stopifnot(length(combined_genes) == ncol(combined_heart$X))
+stopifnot(length(combined_cells) == nrow(combined_heart$X))
+
+counts_matrix <- Matrix::t(as(combined_heart$X, "CsparseMatrix"))
+
+sanitized_genes <- gsub("_", "-", combined_genes)
+dup_idx <- duplicated(sanitized_genes) | duplicated(sanitized_genes, fromLast = TRUE)
+if (sum(dup_idx) > 0) {
+  cat("Genes affected by sanitization collisions:", sum(dup_idx), "\n")
+  print(data.frame(original = combined_genes[dup_idx],
+                   sanitized = sanitized_genes[dup_idx]))
+}
+final_genes <- make.unique(sanitized_genes)
+stopifnot(sum(duplicated(final_genes)) == 0)
+stopifnot(length(final_genes) == nrow(counts_matrix))
+
+final_cells <- as.vector(combined_cells)
+stopifnot(is.null(attributes(final_cells)))
+
+rownames(counts_matrix) <- final_genes
+colnames(counts_matrix) <- final_cells
+
+metadata <- py_to_r(combined_heart$obs)
+metadata <- as.data.frame(metadata, stringsAsFactors = FALSE)
+rownames(metadata) <- final_cells
+
+# 'tech' should have exactly 2 levels (facs/droplet)
+cat("'tech' values (real technology):\n")
+print(table(metadata$tech))
+
+# Rename the original 'batch' column: it's an internal sequencing batch,
+# not the FACS/droplet technology
+if ("batch" %in% colnames(metadata)) {
+  metadata$seq_batch <- metadata$batch
+  metadata$batch <- NULL
+}
+
+# sample_id is built from mouse identity (or sex+age as fallback), WITHOUT
+# tech, so that metacells merge cells from both sequencing technologies
+# for the same mouse / same age-sex point. This relies on 'harmony' as the
+# integration reduction in MetacellsByGroups() to correct for tech-driven
+# batch effects when averaging cells into metacells.
+if ("mouse.id" %in% colnames(metadata)) {
+  metadata$sample_id <- as.character(metadata$mouse.id)
+} else {
+  metadata$sample_id <- paste(metadata$sex, metadata$age, sep = "_")
+}
+
+cat("Numero de sample_id unicos:", dplyr::n_distinct(metadata$sample_id), "\n")
+table(metadata$sample_id)
+
+cat("Do counts_matrix and metadata match?",
+    identical(rownames(metadata), colnames(counts_matrix)), "\n")
+stopifnot(identical(rownames(metadata), colnames(counts_matrix)))
+
+seurat_combined <- CreateSeuratObject(
+  counts = counts_matrix,
+  meta.data = metadata,
+  project = "WGCNA_Mouse_Combined"
+)
+# QC thresholds 
+min_features <- 200
+n_before <- ncol(seurat_combined)
+
+seurat_combined <- subset(
+  seurat_combined,
+  subset = nFeature_RNA > min_features 
+)
+cat("Cells before QC:", n_before, "\n")
+cat("Cells after QC:", ncol(seurat_combined), "\n")
+
+# Remove genes detected in very few cells globally
+min_cells_gene <- 3
+detected_genes <- Matrix::rowSums(GetAssayData(seurat_combined, layer = "counts") > 0)
+genes_to_keep <- names(detected_genes[detected_genes >= min_cells_gene])
+
+cat("Genes before filter:", nrow(seurat_combined), "\n")
+cat("Genes after filter:", length(genes_to_keep), "\n")
+
+seurat_combined <- subset(seurat_combined, features = genes_to_keep)
+seurat_combined_raw<-seurat_combined
+seurat_combined_filt_raw<-subset(seurat_combined_raw, subset = cell_ontology_class != "nan")
+
+celltype_map <- c(
+  "endothelial cell of coronary artery" = "EndothelialCells",
+  "aortic endothelial cell"             = "EndothelialCells",
+  "atrial myocyte"                      = "Myocytes",
+  "ventricular myocyte"                 = "Myocytes",
+  "fibroblast of cardiac tissue"        = "Fibroblasts",
+  "leukocyte"                           = "Leukocytes", 
+  "smooth muscle cell"                  = "SmoothMuscleCells", 
+  "endocardial cell"                    = "EndocardialCells"
+  # mast cell, valve cell -> excluded on purpose (not in this vector = dropped)
+)
+
+meta_raw <- seurat_combined_filt_raw@meta.data
+meta_raw$cell_ontology_class_clean <- trimws(tolower(as.character(meta_raw$cell_ontology_class)))
+
+names(celltype_map) <- tolower(names(celltype_map))
+meta_raw$final_celltype <- celltype_map[meta_raw$cell_ontology_class_clean]
+
+unmapped <- sort(unique(meta_raw$cell_ontology_class[is.na(meta_raw$final_celltype)]))
+cat("Unmapped / excluded cell_ontology_class levels (dropped from analysis):\n")
+print(unmapped)
+
+cat("\nCells per final cell type:\n")
+print(table(meta_raw$final_celltype, useNA = "ifany"))
+
+DefaultAssay(seurat_combined_filt_raw) <- "RNA"
+all_genes <- rownames(seurat_combined_filt_raw)
+expr <- as.matrix(GetAssayData(seurat_combined_filt_raw, layer = "counts")[all_genes, ])
+
+# keep only cells that were successfully mapped to a final cell type
+keep_cells <- rownames(meta_raw)[!is.na(meta_raw$final_celltype)]
+meta_keep  <- meta_raw[keep_cells, ]
+expr_keep  <- expr[, keep_cells]
+
+age_per_mouse <- meta_keep %>%
+  distinct(sample_id, age) %>%
+  group_by(sample_id) %>%
+  mutate(n_ages = n()) %>%
+  ungroup()
+
+stopifnot("Some mice have more than one 'age' value -- inspect age_per_mouse" =
+            all(age_per_mouse$n_ages == 1))
+
+age_lookup <- setNames(as.character(age_per_mouse$age), age_per_mouse$sample_id)
+
+# as.factor() sorts levels alphabetically ("18m" before "3m"), which
+# scrambles chronological order -- build the ordered levels from the
+# numeric part of the label instead, exactly as in the metacell workflow.
+ordered_age_levels <- unique(age_lookup)
+ordered_age_levels <- ordered_age_levels[
+  order(as.numeric(gsub("[^0-9]", "", ordered_age_levels)))
+]
+```
+
+```{r mnn-build-sce}
+seurat_mnn <- seurat_combined_filt_raw[, keep_cells]
+
+seurat_mnn$final_celltype <- meta_keep[colnames(seurat_mnn), "final_celltype"]
+seurat_mnn$sample_id      <- meta_keep[colnames(seurat_mnn), "sample_id"]
+seurat_mnn$age            <- as.character(meta_keep[colnames(seurat_mnn), "age"])
+seurat_mnn$sex            <- meta_keep[colnames(seurat_mnn), "sex"]
+seurat_mnn$tech           <- meta_keep[colnames(seurat_mnn), "tech"]  # "facs" or "droplet"
+
+cat("Cells in the MultiNicheNet input object:", ncol(seurat_mnn), "\n")
+cat("\nCells per final_celltype:\n"); print(table(seurat_mnn$final_celltype))
+cat("\nCells per age:\n"); print(table(seurat_mnn$age))
+cat("\nCells per sex:\n"); print(table(seurat_mnn$sex))
+cat("\nCells per tech:\n"); print(table(seurat_mnn$tech))
+cat("\nMice (sample_id) per age:\n")
+print(table(unique(data.frame(sample_id = seurat_mnn$sample_id, age = seurat_mnn$age))$age))
+
+# MultiNicheNet needs raw counts (it pseudobulks internally via muscat/edgeR),
+# not the already log-normalized data used by WGCNA.
+counts_mat <- Seurat::GetAssayData(seurat_mnn, assay = "RNA", layer = "counts")
+
+# Explicit colData, aligned by cell name -- do NOT rely on as.SingleCellExperiment()
+col_data <- S4Vectors::DataFrame(seurat_mnn@meta.data[colnames(counts_mat), ])
+
+sce <- SingleCellExperiment::SingleCellExperiment(
+  assays  = list(counts = counts_mat),
+  colData = col_data
+)
+
+cat("\nSCE dimensions (genes x cells):", dim(sce), "\n")
+cat("Columns in colData(sce):", ncol(colData(sce)), "\n")
+stopifnot(all(c("final_celltype", "sample_id", "age", "sex", "tech") %in% colnames(colData(sce))))
+```
+
+## Step 0b: drop age levels with too few biological replicates
+
+`multi_nichenet_analysis()` fits its per-celltype pseudobulk model across **all** age levels present in `colData(sce)` at once, not only the two levels involved in a given contrast. An age level backed by a single `sample_id` (mouse) cannot have its between-replicate variability estimated, which breaks DE estimation for every cell type, not just that level -- this must be filtered out before any contrasts are built; no `min_cells` value can fix a lack of biological replicates.
+
+```{r mnn-filter-low-replicate-ages}
+min_samples_per_group <- 2
+
+samples_per_age <- as.data.frame(colData(sce)) %>%
+  distinct(sample_id, age) %>%
+  count(age, name = "n_samples")
+
+print(samples_per_age)
+
+valid_ages <- samples_per_age %>%
+  filter(n_samples >= min_samples_per_group) %>%
+  pull(age)
+
+dropped_ages <- base::setdiff(unique(colData(sce)$age), valid_ages)
+cat("\nAge levels dropped for having <", min_samples_per_group, "samples:",
+    paste(dropped_ages, collapse = ", "), "\n")
+cat("Age levels kept:", paste(valid_ages, collapse = ", "), "\n")
+
+sce <- sce[, colData(sce)$age %in% valid_ages]
+
+# Drop unused factor levels everywhere they could linger
+colData(sce)$age       <- droplevels(base::as.factor(colData(sce)$age))
+colData(sce)$sample_id <- droplevels(base::as.factor(colData(sce)$sample_id))
+
+# Keep ordered_age_levels (from WGCNA_24) in sync with what actually survives here
+ordered_age_levels <- ordered_age_levels[ordered_age_levels %in% valid_ages]
+
+cat("\nRemaining cells:", ncol(sce), "\n")
+cat("Remaining age levels (chronological order):", paste(ordered_age_levels, collapse = ", "), "\n")
+```
+
+## Step 1: Define a single age contrast
+
+`ordered_age_levels` is reused from `WGCNA_24_hdwgcna_HVG.Rmd` (same chronological order used there for `mouse_age`). Instead of generating every pairwise age combination (10 contrasts x 2 directions in the original version), **exactly one contrast is analyzed here: oldest vs. youngest** -- the two extremes of the aging trajectory. This keeps `multi_nichenet_analysis()` fast, and keeps every downstream section (circos plot, LR dotplot, WGCNA-overlap validation, hub-gene ligand activity) consistently about the same single comparison, instead of mixing results from 10 different age-vs-age models.
+
+If you want a different pair of ages, edit `contrast_age_pair` below (it must contain exactly 2 values, both present in `ordered_age_levels`) -- everything downstream (contrast string, `youngest_age`/`oldest_age`, circos plot, validation) adapts automatically.
+
+Before building the contrast, the age labels themselves need fixing: `multi_nichenet_analysis()` requires every group label in `colData(sce)[, group_id]` to be a syntactically valid R name (see `make.names()`), and labels such as `"1m"`, `"3m"`, `"18m"` start with a digit and therefore are not valid.
+
+```{r mnn-fix-age-names}
+
+# make.names() would auto-prefix "1m" -> "X1m", which is inconsistent with
+# how ordered_age_levels was defined in WGCNA_24_hdwgcna_HVG.Rmd -- relabel
+# explicitly instead, using the same mapping in both the age vector and the
+# SCE colData.
+
+age_recode <- setNames(
+  paste0("age", ordered_age_levels),
+  ordered_age_levels
+)
+print(age_recode)
+
+# Relabel the chronological order already used in WGCNA
+ordered_age_levels <- base::unname(age_recode[ordered_age_levels])
+
+# Relabel the age column inside the SCE colData
+colData(sce)$age <- age_recode[as.character(colData(sce)$age)]
+
+cat("\nAge levels in colData(sce) after the fix:\n")
+print(table(colData(sce)$age))
+
+stopifnot(all(make.names(colData(sce)$age) == colData(sce)$age))
+
+# Reference points reused later (circos plot, validation section, etc.)
+youngest_age <- ordered_age_levels[1]
+oldest_age   <- ordered_age_levels[length(ordered_age_levels)]
+cat("\nYoungest age level:", youngest_age, "| Oldest age level:", oldest_age, "\n")
+
+# --- SINGLE CONTRAST --------------------------------------------------------
+# Only ONE age pair is analyzed: oldest vs youngest by default. Change this
+# to any 2 values from ordered_age_levels if you want a different pair.
+contrast_age_pair <- c(youngest_age, oldest_age)  # c(younger, older)
+stopifnot(
+  "contrast_age_pair must have exactly 2 elements" = length(contrast_age_pair) == 2,
+  "contrast_age_pair values must be in ordered_age_levels" =
+    all(contrast_age_pair %in% ordered_age_levels)
+)
+
+younger <- contrast_age_pair[1]
+older   <- contrast_age_pair[2]
+
+contrast_tbl <- tibble(
+  contrast = paste0(older, "-", younger),
+  group    = older
+)
+
+contrasts_oi <- paste0(
+  "'", paste(contrast_tbl$contrast, collapse = "','"), "'"
+)
+
+cat("\nSingle contrast analyzed (contrasts_oi):\n"); print(contrasts_oi)
+cat("\ncontrast_tbl:\n"); print(contrast_tbl)
+
+```
+
+`sample_id` has the same problem: values such as `"18-F-50"` start with a digit and contain hyphens, which are also invalid for `make.names()`. The original label is kept as a separate column for traceability.
+
+```{r mnn-fix-sample-id}
+# Original sample_id looks like "18-F-50": starts with a digit and has
+# hyphens -> invalid for make.names(). Keep the original and create a
+# valid version to use in the analysis.
+
+colData(sce)$sample_id_original <- colData(sce)$sample_id
+colData(sce)$sample_id <- make.names(colData(sce)$sample_id)
+
+cat("Example mapping original sample_id -> valid sample_id:\n")
+print(head(unique(data.frame(
+  original = colData(sce)$sample_id_original,
+  valid    = colData(sce)$sample_id
+))))
+
+stopifnot(all(make.names(colData(sce)$sample_id) == colData(sce)$sample_id))
+stopifnot(length(unique(colData(sce)$sample_id_original)) == length(unique(colData(sce)$sample_id)))
+cat("\nNumber of unique sample_id values:", length(unique(colData(sce)$sample_id)), "\n")
+
+
+colData(sce)$mouse_id_original <- colData(sce)$mouse.id
+colData(sce)$mouse.id <- make.names(colData(sce)$mouse.id)
+
+
+stopifnot(all(make.names(colData(sce)$mouse.id) == colData(sce)$mouse.id))
+stopifnot(length(unique(colData(sce)$mouse_id_original)) == length(unique(colData(sce)$mouse.id)))
+cat("\nNumber of unique sample_id values:", length(unique(colData(sce)$mouse.id)), "\n")
+```
+
+## Step 2: Load the NicheNet prior model (ligand-receptor + ligand-target + signaling, mouse)
+
+Beyond `lr_network` and `ligand_target_matrix` (already used for prioritization and hub-gene ligand activity), two more prior-model objects are loaded here: `weighted_networks` (ligand-receptor + signaling + TF-target confidence, needed for the receptor heatmap and the signaling-path inference below) and `ligand_tf_matrix` (ligand-to-TF regulatory potential, needed only for signaling-path inference). Both are the mouse versions from the same NicheNet v2 Zenodo record used for `lr_network`/`ligand_target_matrix`.
+
+```{r mnn-prior-model}
+options(timeout = 300)
+
+lr_network <- readRDS("nichenet_prior/lr_network_mouse_21122021.rds"
+) %>%
+  dplyr::rename(ligand = from, receptor = to) %>%
+  distinct(ligand, receptor)
+
+ligand_target_matrix <- readRDS(
+  "nichenet_prior/ligand_target_matrix_nsga2r_final_mouse.rds"
+)
+
+# Needed for: (1) the ligand-receptor heatmap (Step 10-style), and
+# (2) signaling-path inference (Step 13-style), both added below.
+weighted_networks <- readRDS(
+  "nichenet_prior/weighted_networks_nsga2r_final_mouse.rds"
+)
+
+# Needed only for signaling-path inference (ligand -> TF -> target).
+ligand_tf_matrix <- readRDS(
+  "nichenet_prior/ligand_tf_matrix_nsga2r_final_mouse.rds"
+)
+
+cat("LR network:", nrow(lr_network), "ligand-receptor pairs\n")
+cat("Ligand-target matrix:", dim(ligand_target_matrix)[1], "targets x",
+    dim(ligand_target_matrix)[2], "ligands\n")
+cat("Weighted networks: lr_sig =", nrow(weighted_networks$lr_sig), "edges | gr =",
+    nrow(weighted_networks$gr), "edges\n")
+cat("Ligand-TF matrix:", dim(ligand_tf_matrix)[1], "TFs x",
+    dim(ligand_tf_matrix)[2], "ligands\n")
+```
+
+## Steps 3-6: pseudobulk + per-celltype DE, ligand activity and prioritization
+
+`multi_nichenet_analysis()` is the wrapper that chains steps 3 to 6 of the classic workflow (pseudobulk/abundance calculation per cell type, DE per cell type via muscat/edgeR, ligand activity analysis with the prior model, and the multi-criteria prioritization table). `min_cells` requires a minimum number of cells per sample x celltype combination for that combination to enter the analysis -- adjust if some age groups have few replicates per cell type.
+
+**Design note on `batches`/`covariates`:** `sex` and `tech` (FACS vs. droplet) were both considered as covariate/batch terms, but checking `table(colData(sce)$age, colData(sce)$tech)` and `table(colData(sce)$age, colData(sce)$sex)` showed that in this dataset both variables are almost completely confounded with `age` (e.g. `age1m`, `age18m`, `age21m`, `age30m` are each represented by a single technique, and `age1m`/`age21m`/`age24m`/`age30m` are each represented by a single sex). Because of this, the model cannot separate an age effect from a sex/technique effect for most contrasts, so both are left out (`batches = NA`, `covariates = NA`) and this is documented here as a known limitation of the Tabula Muris Senis sampling design rather than a modeling choice.
+
+```{r mnn-run-analysis}
+
+multinichenet_output <- multi_nichenet_analysis(
+  sce                   = sce,
+  celltype_id           = "final_celltype",
+  sample_id             = "sample_id",
+  group_id              = "age",
+  batches               = NA,
+  covariates            = NA,
+  lr_network            = lr_network,
+  ligand_target_matrix  = ligand_target_matrix,
+  contrasts_oi          = contrasts_oi,
+  contrast_tbl          = contrast_tbl,
+  min_cells             = 3,
+  logFC_threshold       = 0.50,
+  p_val_threshold       = 0.05,
+  fraction_cutoff       = 0.05,
+  p_val_adj             = FALSE,
+  empirical_pval        = FALSE,
+  top_n_target          = 250,
+  verbose               = TRUE
+)
+
+saveRDS(multinichenet_output, "multinichenet_output_age.rds")
+cat("Total LR pairs in the prioritization table:",
+    nrow(multinichenet_output$prioritization_tables$group_prioritization_tbl), "\n")
+```
+
+```{r}
+multinichenet_output<-readRDS("multinichenet_output_age.rds")
+```
+
+### Which cell types were excluded from DE, and why
+
+`multi_nichenet_analysis()` silently drops any cell type that does not have at least 2 samples per group passing `min_cells` (it prints this to the console log, but does not return it as a structured object). This chunk reconstructs that same table directly from `colData(sce)`, so it is available for inspection without having to scroll back through the log.
+
+```{r mnn-check-excluded-celltypes}
+included_celltypes <- tryCatch(
+  unique(multinichenet_output$celltype_info$sender_receiver_info$sender),
+  error = function(e) character(0)
+)
+if (length(included_celltypes) == 0) {
+  # Fallback across multinichenetr versions where the info object is structured differently
+  included_celltypes <- tryCatch(
+    unique(multinichenet_output$prioritization_tables$group_prioritization_tbl$sender),
+    error = function(e) character(0)
+  )
+}
+
+samples_passing_min_cells <- as.data.frame(colData(sce)) %>%
+  count(age, final_celltype, sample_id, name = "n_cells") %>%
+  filter(n_cells >= 10) %>%  # keep in sync with min_cells above
+  count(age, final_celltype, name = "n_samples_passing")
+
+celltype_status <- samples_passing_min_cells %>%
+  group_by(final_celltype) %>%
+  summarise(
+    n_age_groups_with_2plus_samples = sum(n_samples_passing >= 2),
+    n_age_groups_total              = n_distinct(age),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    likely_included = final_celltype %in% included_celltypes,
+    fully_covered    = n_age_groups_with_2plus_samples == n_age_groups_total
+  ) %>%
+  arrange(desc(n_age_groups_with_2plus_samples))
+
+cat("Cell type coverage after the min_samples_per_group / min_cells filters:\n")
+print(celltype_status)
+
+cat("\nCell types confirmed present in multinichenet_output:",
+    paste(included_celltypes, collapse = ", "), "\n")
+```
+
+From here on, `multinichenet_output`, `lr_network` and `ligand_target_matrix` are available for the two WGCNA integration sections below.
+
+### QC: cell/sample abundance diagnostics (exported to PDF)
+
+Sanity check before trusting the prioritization results: how many cells per sample x celltype combination actually passed `min_cells`, and how balanced is that across age groups. `multi_nichenet_analysis()` already computes this internally in `abundance_expression_info`; we reuse its built-in plot when available and fall back to a manual count table otherwise (useful given the tech/sex imbalance documented above).
+
+```{r mnn-qc-abundance, fig.width=9, fig.height=6}
+abund_info <- multinichenet_output$abundance_expression_info
+
+p_abundance <- tryCatch(
+  abund_info$abund_plot_sample,
+  error = function(e) NULL
+)
+
+if (is.null(p_abundance)) {
+  # Fallback: build the same kind of diagnostic manually from colData(sce)
+  abundance_manual <- as.data.frame(colData(sce)) %>%
+    count(sample_id, final_celltype, age, name = "n_cells")
+
+  p_abundance <- ggplot(abundance_manual, aes(x = sample_id, y = n_cells, fill = age)) +
+    geom_col() +
+    facet_wrap(~ final_celltype, scales = "free_y") +
+    labs(title = "Cells per sample x celltype", x = "Sample", y = "N cells") +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6))
+}
+
+print(p_abundance)
+ggsave("plot_QC_abundance_per_sample_celltype.pdf", p_abundance, width = 9, height = 6)
+```
+
+### Overview plot: cell-cell communication summary (exported to PDF)
+
+A first exploratory summary across all age contrasts pooled together: how many distinct LR pairs were prioritized per sender-receiver cell type pair.
+
+```{r mnn-plot-sender-receiver-overview, fig.width=8, fig.height=6}
+sender_receiver_overview <- multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  distinct(group, sender, receiver, ligand, receptor) %>%
+  count(sender, receiver, name = "n_LR_pairs")
+
+p_sender_receiver <- ggplot(sender_receiver_overview, aes(x = sender, y = receiver, fill = n_LR_pairs)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "#f7fbff", high = "#08306b") +
+  labs(
+    title = "Cell-cell communication overview",
+    subtitle = "Number of distinct LR pairs per sender-receiver cell type pair (contrast age30m-age3m)",
+    x = "Sender cell type", y = "Receiver cell type", fill = "N LR pairs"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_sender_receiver)
+
+ggsave("plot_sender_receiver_overview.pdf", p_sender_receiver, width = 8, height = 6)
+```
+
+### Circos plot and LR dotplot for the oldest-vs-youngest contrast
+
+Two of MultiNicheNet's signature plots for a single contrast: a circos diagram of sender -\> receiver communication, and a dotplot combining expression, ligand activity and logFC for the top LR pairs. Function names below follow the standard multinichenetr API; if your installed package version differs, run `ls("package:multinichenetr")` and adjust the function names accordingly -- these plotting helpers have changed across versions.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(circlize)
+library(RColorBrewer)
+library(grid)
+library(gridExtra)
+library(magick)  # para rasterizar los PDFs individuales
+
+graphics.off()
+
+# ==============================================================================
+# 1. REORDER AGES IN MULTINICHENET (age3m AT THE START)
+# ==============================================================================
+age_order <- ordered_age_levels  # dynamic (was hardcoded to a fixed set of 5 age strings)
+
+multinichenet_output$prioritization_tables <- lapply(
+  multinichenet_output$prioritization_tables, function(tbl) {
+    if (is.data.frame(tbl) && "group" %in% colnames(tbl)) {
+      tbl$group <- factor(tbl$group, levels = age_order)
+    }
+    return(tbl)
+  }
+)
+
+if (!is.null(multinichenet_output$celltype_info$sample_id_info)) {
+  if ("group" %in% colnames(multinichenet_output$celltype_info$sample_id_info)) {
+    multinichenet_output$celltype_info$sample_id_info$group <- factor(
+      multinichenet_output$celltype_info$sample_id_info$group, 
+      levels = age_order
+    )
+  }
+}
+
+# ==============================================================================
+# 2. EXTRACT TOP L-R PAIRS FOR CONTRAST
+# ==============================================================================
+contrast_oi <- paste0(oldest_age, "-", youngest_age)
+
+get_lr_pairs_for_contrast <- function(contrast_str, top_n = 50) {
+  tbl <- multinichenet_output$prioritization_tables$group_prioritization_tbl
+  stopifnot("contrast" %in% colnames(tbl))
+  
+  rank_col <- intersect(c("prioritization_score", "prioritization_rank"), colnames(tbl))
+  tbl_contrast <- tbl %>% dplyr::filter(contrast == contrast_str)
+  
+  if (length(rank_col) > 0) {
+    tbl_contrast <- tbl_contrast %>% 
+      dplyr::arrange(if (rank_col[1] == "prioritization_rank") prioritization_rank else desc(.data[[rank_col[1]]]))
+  }
+  
+  tbl_contrast %>% 
+    dplyr::distinct(sender, receiver, ligand, receptor, .keep_all = TRUE) %>% 
+    dplyr::slice_head(n = top_n)
+}
+
+lr_prioritized_50 <- get_lr_pairs_for_contrast(contrast_oi, top_n = 50)
+
+cat("Interactions retrieved for '", contrast_oi, "': ", nrow(lr_prioritized_50), "\n")
+
+# ==============================================================================
+# 3. UNIFIED CELL-TYPE COLOR PALETTE
+# ==============================================================================
+all_senders   <- unique(lr_prioritized_50$sender)
+all_receivers <- unique(lr_prioritized_50$receiver)
+all_celltypes <- unique(c(all_senders, all_receivers))
+
+palette_colors <- RColorBrewer::brewer.pal(max(3, length(all_celltypes)), "Set2")[1:length(all_celltypes)]
+names(palette_colors) <- all_celltypes
+
+colors_sender_vec   <- palette_colors[all_senders]
+colors_receiver_vec <- palette_colors[all_receivers]
+
+# ==============================================================================
+# 4. SPLIT TOP 50 INTO 3 CHUNKS
+# ==============================================================================
+n_total    <- nrow(lr_prioritized_50)
+n_chunks   <- 3
+chunk_size <- ceiling(n_total / n_chunks)
+
+circos_part_list <- list()
+for (i in 1:n_chunks) {
+  start_idx <- (i - 1) * chunk_size + 1
+  end_idx   <- min(i * chunk_size, n_total)
+  
+  if (start_idx <= n_total) {
+    tbl_i <- lr_prioritized_50 %>% 
+      dplyr::slice(start_idx:end_idx) %>% 
+      dplyr::select(-dplyr::any_of(c("weight", "weight.x", "weight.y")))
+    colnames(tbl_i) <- make.unique(colnames(tbl_i))
+    circos_part_list[[paste0("part", i)]] <- tbl_i
+  }
+}
+
+# ==============================================================================
+# 5. RENDERIZAR CADA CÍRCULO EN SU PROPIO PDF (método que YA sabemos que funciona)
+# ==============================================================================
+cat("\n--- Rendering individual circos plots (as single-page PDFs) ---\n")
+
+tmp_dir   <- tempdir()
+pdf_paths <- c()
+
+for (i in seq_along(circos_part_list)) {
+  
+  part_name <- names(circos_part_list)[i]
+  tbl_i     <- circos_part_list[[part_name]]
+  pdf_path  <- file.path(tmp_dir, paste0("circos_", part_name, ".pdf"))
+  
+  pdf(pdf_path, width = 8, height = 8)
+  
+  result <- tryCatch({
+    par(mar = c(3, 3, 4, 3))
+    circlize::circos.clear()
+    
+    make_circos_group_comparison(
+      prioritized_tbl_oi = tbl_i,
+      colors_sender       = colors_sender_vec,
+      colors_receiver     = colors_receiver_vec
+    )
+    
+    title(
+      main = paste0("Part ", i, " [", nrow(tbl_i), " pairs]"),
+      line = 1,
+      cex.main = 1.6,
+      font.main = 2
+    )
+    
+    TRUE
+  }, error = function(e) {
+    message("ERROR en ", part_name, ": ", conditionMessage(e))
+    FALSE
+  })
+  
+  dev.off()
+  
+  if (isTRUE(result)) {
+    cat(part_name, "renderizado correctamente (", nrow(tbl_i), "pares )\n")
+    pdf_paths <- c(pdf_paths, pdf_path)
+  } else {
+    cat(part_name, "NO se pudo renderizar — revisa el error de arriba\n")
+  }
+}
+
+# ==============================================================================
+# 6. RASTERIZAR CADA PDF INDIVIDUAL A IMAGEN DE ALTA RESOLUCIÓN (con magick)
+# ==============================================================================
+cat("\n--- Converting individual PDFs to high-res images ---\n")
+
+circle_grobs <- lapply(pdf_paths, function(p) {
+  img <- magick::image_read_pdf(p, density = 300)
+  grid::rasterGrob(as.raster(img), interpolate = TRUE)
+})
+
+# ==============================================================================
+# 7. RENDERIZAR LA LEYENDA (una sola vez) COMO SU PROPIO PDF -> IMAGEN
+# ==============================================================================
+legend_pdf_path <- file.path(tmp_dir, "circos_legend.pdf")
+
+pdf(legend_pdf_path, width = 2.5, height = 8)
+par(mar = c(1, 1, 1, 1))
+plot.new()
+legend(
+  "center",
+  legend = names(palette_colors),
+  fill = palette_colors,
+  border = NA,
+  bty = "n",
+  title = "Cell Types",
+  title.font = 2,
+  cex = 1.3,
+  y.intersp = 1.6
+)
+dev.off()
+
+legend_img  <- magick::image_read_pdf(legend_pdf_path, density = 300)
+legend_grob <- grid::rasterGrob(as.raster(legend_img), interpolate = TRUE)
+
+# ==============================================================================
+# 8. ENSAMBLAR: CÍRCULOS EN ORDEN A LA IZQUIERDA + LEYENDA UNA SOLA VEZ A LA DERECHA
+# ==============================================================================
+cat("\n--- Assembling final single-page PDF ---\n")
+
+circos_pdf_filename <- "plot_circos_3panels_top50.pdf"
+
+if (length(circle_grobs) == 0) {
+  stop("Ningún círculo se renderizó correctamente. Revisa los mensajes de error de arriba antes de continuar.")
+}
+
+pdf(circos_pdf_filename, width = 24, height = 7.5)
+
+grid.arrange(
+  grobs = c(circle_grobs, list(legend_grob)),
+  ncol  = length(circle_grobs) + 1,
+  widths = c(rep(3, length(circle_grobs)), 1),
+  top = grid::textGrob(
+    paste0("Top L-R Interactions (", contrast_oi, ")"),
+    gp = grid::gpar(fontsize = 16, fontface = "bold")
+  )
+)
+
+dev.off()
+
+
+
+# ==============================================================================
+# 9. LR DOTPLOTS (TOP 50 SPLIT INTO 3 PARTS) — SIN CAMBIOS
+# ==============================================================================
+cat("\n--- Generating LR Dotplots (Top 50 split into 3 parts) ---\n")
+
+for (part_name in names(circos_part_list)) {
+  i <- as.integer(sub("part", "", part_name))
+  start_idx <- (i - 1) * chunk_size + 1
+  end_idx   <- min(i * chunk_size, n_total)
+  tbl_sub   <- lr_prioritized_50 %>% dplyr::slice(start_idx:end_idx)
+  
+  p_sub <- tryCatch(
+    make_sample_lr_prod_activity_plots(
+      prioritization_tables = multinichenet_output$prioritization_tables,
+      prioritized_tbl_oi    = tbl_sub
+    ),
+    error = function(e) {
+      message(" Error in Dotplot of ", part_name, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+  
+  if (!is.null(p_sub)) {
+    p_sub_wide <- p_sub & 
+      theme(
+        axis.text.x = element_text(size = 6.5, angle = 45, hjust = 0, vjust = 0.5),
+        axis.text.y = element_text(size = 7.5),
+        strip.text  = element_text(size = 7.5, face = "bold"),
+        plot.margin = margin(t = 35, r = 15, b = 15, l = 15, unit = "pt")
+      )
+    
+    dotplot_pdf_name <- paste0("plot_LR_dotplot_", part_name, "_ultra_wide.pdf")
+    ggsave(dotplot_pdf_name, p_sub_wide, width = 22, height = 13, limitsize = FALSE)
+    cat("LR Dotplot saved as:", dotplot_pdf_name, "\n")
+  }
+}
+
+```
+
+## Validation: overlap between age-associated WGCNA modules and MultiNicheNet prioritization
+
+Idea: if a ligand or receptor prioritized by MultiNicheNet as relevant for the age contrast **also** falls inside a WGCNA module that the independent WGCNA analysis already flagged as age-associated -- and, moreover, in the **same cell type** (sender for the ligand, receiver for the receptor) -- that is cross-method evidence from two approaches that start from different information (co-expression topology vs. ligand-receptor prior model + DE).
+
+```{r}
+
+# ============================================================
+# 0. NUEVO -- combinar correlación lineal (significant_modules)
+#    y trayectoria (significant_trajectory_modules) en un solo
+#    criterio de "módulo asociado a edad". Va ANTES de todo lo
+#    demás que dependa de significant_modules.
+# ============================================================
+age_association_summary <- module_trait_table %>%
+  dplyr::select(module, correlation, p_value_corr = p_value, fdr_corr = fdr) %>%
+  full_join(
+    module_trajectory %>%
+      dplyr::select(module, shape, category, p_value_traj = p_value,
+                    fdr_traj = fdr, r_squared),
+    by = "module"
+  ) %>%
+  mutate(
+    sig_correlation = !is.na(fdr_corr) & fdr_corr < 0.05,
+    sig_trajectory  = !is.na(fdr_traj) & fdr_traj < 0.05,
+    age_associated  = sig_correlation | sig_trajectory
+  ) %>%
+  arrange(desc(age_associated), fdr_corr, fdr_traj)
+
+age_associated_modules <- age_association_summary %>%
+  filter(age_associated) %>%
+  pull(module)
+
+cat("Módulos asociados a edad (correlación lineal y/o trayectoria):",
+    length(age_associated_modules), "\n")
+print(age_association_summary %>% filter(age_associated) %>%
+        dplyr::select(module, correlation, fdr_corr, shape, category, fdr_traj))
+
+```
+
+```{r multinichenet-validation-setup}
+
+# Same fix as the circos/dotplot section above: filter by the exact
+# `contrast` string, not by the pooled `group` label, which would otherwise
+# mix several different age comparisons together.
+age_group_oi <- oldest_age  # kept for readable labels/titles below
+
+# Target the single contrast defined in Step 1 (dynamic, not hardcoded --
+# with contrast_tbl now holding exactly one row, this is that one contrast).
+contrast_oi <- contrast_tbl$contrast[1]
+
+lr_prioritized <- multinichenet_output$prioritization_tables$group_prioritization_tbl %>% dplyr::filter(contrast == contrast_oi) %>% dplyr::slice_max(order_by = prioritization_score, n = 250)
+```
+
+```{r multinichenet-validation-crossref}
+
+# ============================================================
+module_ct_lookup <- gene_celltype_module %>%
+  filter(module %in% age_associated_modules) %>%   # antes: significant_modules
+  distinct(module, celltype, gene)
+
+lr_prioritized_annotated <- lr_prioritized %>%
+  left_join(
+    module_ct_lookup %>% rename(ligand = gene, sender = celltype, ligand_module = module),
+    by = c("ligand", "sender")
+  ) %>%
+  left_join(
+    module_ct_lookup %>% rename(receptor = gene, receiver = celltype, receptor_module = module),
+    by = c("receptor", "receiver")
+  )
+
+overlap_summary <- lr_prioritized_annotated %>%
+  summarise(
+    n_total_pairs            = n(),
+    n_ligand_in_age_module   = sum(!is.na(ligand_module)),
+    n_receptor_in_age_module = sum(!is.na(receptor_module)),
+    n_both_in_age_module     = sum(!is.na(ligand_module) & !is.na(receptor_module))
+  )
+
+cat("Overlap summary (age-prioritized LR pairs vs. age-associated WGCNA modules):\n")
+print(overlap_summary)
+write.csv(lr_prioritized_annotated, "multinichenet_age_LR_wgcna_overlap.csv", row.names = FALSE)
+```
+
+### Is the overlap greater than expected by chance?
+
+Global hypergeometric test: of all ligand/receptor genes prioritized by MultiNicheNet for the age contrast (that were also part of the tested universe in WGCNA), how many fall in an age-associated module, compared to the proportion expected under random assignment?
+
+```{r multinichenet-validation-hypergeom}
+
+age_module_genes <- gene_celltype_module %>%
+  filter(module %in% age_associated_modules) %>%   # antes: significant_modules
+  distinct(gene) %>%
+  pull(gene)
+
+lr_genes_tested <- unique(c(lr_prioritized$ligand, lr_prioritized$receptor))
+lr_genes_tested <- intersect(lr_genes_tested, universe_symbols)
+
+n_overlap  <- length(intersect(lr_genes_tested, age_module_genes))
+n_age_mod  <- length(intersect(age_module_genes, universe_symbols))
+n_universe <- length(universe_symbols)
+n_lr       <- length(lr_genes_tested)
+
+p_enrich <- phyper(n_overlap - 1, n_age_mod, n_universe - n_age_mod, n_lr, lower.tail = FALSE)
+
+cat("MultiNicheNet ligand/receptor genes also present in the WGCNA network:", n_lr, "\n")
+cat("From which,", n_overlap, "fall into a WGCNA module asociated with age \n")
+cat("Hipergeometric enrichment, p =", signif(p_enrich, 3), "\n")
+```
+
+```{r multinichenet-validation-plot, fig.width=7, fig.height=5}
+
+plot_data <- bind_rows(
+  lr_prioritized_annotated %>% filter(!is.na(ligand_module)) %>%
+    transmute(module = ligand_module, role = "Ligand"),
+  lr_prioritized_annotated %>% filter(!is.na(receptor_module)) %>%
+    transmute(module = receptor_module, role = "Receptor")
+)
+
+p_validation <- ggplot(plot_data, aes(x = module, fill = role)) +
+  geom_bar(position = "dodge") +
+  labs(x = "WGCNA module (age-associated)", y = "Number of prioritized LR pairs",
+       title = "MultiNicheNet LR pairs falling in age-associated WGCNA modules",
+       subtitle = paste0("Contrast: ", age_group_oi, " | global hypergeometric p = ", signif(p_enrich, 3))) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_validation)
+
+ggsave("plot_LR_wgcna_module_overlap.pdf", p_validation, width = 7, height = 5)
+```
+
+### Validation across contrasts (generic, works for 1..N contrasts)
+
+The spotlight above covered the single contrast defined in Step 1 (`r contrast_oi`). The same overlap + hypergeometric logic is generalized here and applied to **every contrast in `contrast_tbl$contrast`** -- iterating over `contrast`, not the pooled `group` label, since a single age level can be the "group" of several different comparisons at once (see the note in the circos/dotplot section above). With the pipeline now restricted to a single age contrast (Step 1), this loop runs over exactly that one contrast and reproduces the spotlight result above; the code is kept generic (rather than hardcoded to one contrast) so it keeps working unchanged if you ever add more rows to `contrast_tbl`.
+
+```{r}
+
+
+# 1. Función para extraer los pares usando prioritization_tables
+get_lr_pairs_for_contrast <- function(contrast_str, multinichenet_res, top_n = 250) {
+  
+  # Acceso directo a prioritization_tables (estructura estándar de MultiNicheNet)
+  # Si prioritization_tables es una lista de tablas, toma group_prioritization_tbl;
+  # si es el data frame directo, lo asigna.
+  prior_tbl <- if (is.data.frame(multinichenet_res$prioritization_tables)) {
+    multinichenet_res$prioritization_tables
+  } else if (!is.null(multinichenet_res$prioritization_tables$group_prioritization_tbl)) {
+    multinichenet_res$prioritization_tables$group_prioritization_tbl
+  } else {
+    NULL
+  }
+  
+  if (is.null(prior_tbl)) {
+    warning(paste("No se encontró la tabla de priorización para el contraste:", contrast_str))
+    return(NULL)
+  }
+  
+  # Detectar automáticamente si la columna se llama prioritization_score o score
+  score_col <- if ("prioritization_score" %in% colnames(prior_tbl)) {
+    "prioritization_score"
+  } else if ("score" %in% colnames(prior_tbl)) {
+    "score"
+  } else {
+    colnames(prior_tbl)[grep("score|rank", colnames(prior_tbl))[1]]
+  }
+  
+  # Filtrar los top N pares por contraste
+  lr_top <- prior_tbl %>%
+    filter(contrast == contrast_str) %>%
+    slice_max(order_by = .data[[score_col]], n = top_n, with_ties = FALSE)
+  
+  return(lr_top)
+}
+
+# 2. Función de validación por contraste
+run_validation_for_contrast <- function(contrast_str, multinichenet_res) {
+  
+  lr_oi <- get_lr_pairs_for_contrast(
+    contrast_str = contrast_str, 
+    multinichenet_res = multinichenet_res, 
+    top_n = 250
+  )
+  
+  # Retornar tibble estructurado si no hay datos
+  if (is.null(lr_oi) || nrow(lr_oi) == 0) {
+    return(tibble(
+      contrast                 = contrast_str,
+      n_total_pairs            = 0,
+      n_ligand_in_age_module   = 0,
+      n_receptor_in_age_module = 0,
+      n_lr_genes_tested        = 0,
+      n_lr_genes_in_age_module = 0,
+      p_hypergeometric         = NA_real_
+    ))
+  }
+  
+  # Anotación con los módulos por celda/gen
+  lr_oi_annotated <- lr_oi %>%
+    left_join(
+      module_ct_lookup %>% rename(ligand = gene, sender = celltype, ligand_module = module),
+      by = c("ligand", "sender")
+    ) %>%
+    left_join(
+      module_ct_lookup %>% rename(receptor = gene, receiver = celltype, receptor_module = module),
+      by = c("receptor", "receiver")
+    )
+  
+  # Genes únicos involucrados en las interacciones
+  lr_genes_oi <- unique(c(lr_oi$ligand, lr_oi$receptor))
+  lr_genes_oi <- intersect(lr_genes_oi, universe_symbols)
+  
+  n_overlap_oi <- length(intersect(lr_genes_oi, age_module_genes))
+  n_lr_oi      <- length(lr_genes_oi)
+  
+  # Test hipergeométrico
+  p_oi <- if (n_lr_oi > 0) {
+    phyper(n_overlap_oi - 1, n_age_mod, n_universe - n_age_mod, n_lr_oi, lower.tail = FALSE)
+  } else {
+    NA_real_
+  }
+  
+  tibble(
+    contrast                 = contrast_str,
+    n_total_pairs            = nrow(lr_oi),
+    n_ligand_in_age_module   = sum(!is.na(lr_oi_annotated$ligand_module)),
+    n_receptor_in_age_module = sum(!is.na(lr_oi_annotated$receptor_module)),
+    n_lr_genes_tested        = n_lr_oi,
+    n_lr_genes_in_age_module = n_overlap_oi,
+    p_hypergeometric         = p_oi
+  )
+}
+
+# 3. Ejecución corregida sobre todos los contrastes
+validation_all_contrasts <- purrr::map_dfr(
+  unique(contrast_tbl$contrast), 
+  ~ run_validation_for_contrast(.x, multinichenet_res = multinichenet_output)
+) %>%
+  mutate(
+    fdr_hypergeometric = if (all(is.na(p_hypergeometric))) {
+      NA_real_
+    } else {
+      p.adjust(p_hypergeometric, method = "BH")
+    }
+  ) %>%
+  arrange(p_hypergeometric)
+```
+
+### GO enrichment of the LR / age-module overlap gene set (reused from WGCNA_24)
+
+No new enrichment is run here. `WGCNA_24.Rmd` already computed GO Biological Process enrichment per module -- `go_full_module_df` (all module genes) and `go_hubs_df` (hub genes only), both already restricted to `pvalueCutoff = 0.05` and BH-adjusted -- and both objects are still in the environment from that earlier run. This section just **filters** those precomputed results down to the terms whose gene set (`geneID`, slash-separated gene symbols since `readable = TRUE` was used) overlaps with the genes that are *both* LR-prioritized by MultiNicheNet *and* already in an age-associated module (`overlap_genes`, same definition as the hypergeometric test above), restricted to `significant_modules`.
+
+```{r}
+
+library(tidyverse)
+
+# Resolver conflictos de nombres entre tidyverse y paquetes tipo Bioconductor/lubridate
+if (requireNamespace("conflicted", quietly = TRUE)) {
+  library(conflicted)
+  conflicts_prefer(dplyr::select, .quiet = TRUE)
+  conflicts_prefer(dplyr::filter, .quiet = TRUE)
+  conflicts_prefer(dplyr::mutate, .quiet = TRUE)
+  conflicts_prefer(dplyr::arrange, .quiet = TRUE)
+  conflicts_prefer(base::intersect, .quiet = TRUE)
+}
+
+overlap_genes <- lr_genes_tested[lr_genes_tested %in% age_module_genes]
+cat("Genes entrando al filtro GO (LR-priorizados Y en un módulo asociado a edad):",
+    length(overlap_genes), "\n")
+
+filter_precomputed_go <- function(go_df, source_label) {
+  if (is.null(go_df) || nrow(go_df) == 0) return(NULL)
+  
+  go_df %>%
+    dplyr::filter(module %in% age_associated_modules) %>%   
+    dplyr::filter(!is.na(geneID) & geneID != "") %>%
+    dplyr::mutate(
+      # str_split devuelve una lista directamente sin requerir índices numéricos arriesgados
+      current_genes     = stringr::str_split(as.character(geneID), "/"),
+      intersect_genes   = purrr::map(current_genes, ~ base::intersect(.x, overlap_genes)),
+      n_overlap_genes   = purrr::map_int(intersect_genes, length),
+      overlap_hit_genes = purrr::map_chr(intersect_genes, ~ paste(.x, collapse = "/"))
+    ) %>%
+    dplyr::filter(n_overlap_genes > 0) %>%
+    dplyr::mutate(go_source = source_label) %>%
+    dplyr::arrange(p.adjust) %>%
+    dplyr::select(-current_genes, -intersect_genes)
+}
+
+go_overlap_full <- filter_precomputed_go(go_bp_by_module_celltype, "GO_BP (todos los genes del módulo)")
+
+hub_lookup <- hub_genes_table %>% dplyr::distinct(module, celltype, gene)
+
+go_overlap_hubs <- go_overlap_full %>%
+  dplyr::mutate(
+    # Aplicamos la misma lógica segura con stringr para evitar subíndices fuera de límites
+    split_hits    = stringr::str_split(ifelse(is.na(overlap_hit_genes), "", overlap_hit_genes), "/"),
+    target_hubs   = purrr::map2(module, celltype, ~ hub_lookup$gene[hub_lookup$module == .x & hub_lookup$celltype == .y]),
+    intersect_hub = purrr::map2(split_hits, target_hubs, base::intersect),
+    hub_hit_genes = purrr::map_chr(intersect_hub, ~ paste(.x, collapse = "/"))
+  ) %>%
+  dplyr::filter(hub_hit_genes != "") %>%
+  dplyr::mutate(go_source = "GO_BP (subset con hub genes)") %>%
+  dplyr::select(-split_hits, -target_hubs, -intersect_hub)
+
+go_overlap_combined <- dplyr::bind_rows(go_overlap_hubs, go_overlap_full)
+
+cat("Términos GO BP (de WGCNA_24) que tocan el set de solape LR/módulo:",
+    nrow(go_overlap_combined), "\n")
+
+write.csv(go_overlap_combined, "GO_LR_wgcna_overlap_from_precomputed.csv", row.names = FALSE)
+
+go_enrich_plot <- NULL
+if (!is.null(go_overlap_combined) && nrow(go_overlap_combined) > 0) {
+  
+  go_overlap_top <- go_overlap_combined %>%
+    dplyr::group_by(go_source) %>%
+    dplyr::slice_min(p.adjust, n = 15, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      # Etiqueta más corta y envuelta en varias líneas para que no aplaste el panel
+      label = stringr::str_wrap(paste(Description, celltype, sep = " | "), width = 45)
+    )
+  
+  cat("Distribución de términos por go_source:\n")
+  print(table(go_overlap_top$go_source))
+  
+  go_enrich_plot <- ggplot(
+    go_overlap_top,
+    aes(x = reorder(label, -p.adjust),
+        y = -log10(p.adjust), size = n_overlap_genes, color = module)
+  ) +
+    geom_point(alpha = 0.8) +
+    coord_flip() +
+    facet_wrap(~ go_source, scales = "free_y", ncol = 1) +
+    scale_size_continuous(range = c(2, 7)) +
+    labs(x = NULL, y = "-log10(p.adjust)",
+         color = "Módulo", size = "N genes solapados",
+         title = "Términos GO (BP) de WGCNA_24 que tocan el set de solape LR/WGCNA",
+         subtitle = "Enrichment reutilizado tal cual de WGCNA_24.Rmd -- no recalculado aquí") +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", size = 11, margin = margin(b = 4)),
+      plot.subtitle = element_text(size = 8, color = "gray40", margin = margin(b = 10)),
+      axis.text.y = element_text(size = 7.5, lineheight = 0.85),
+      strip.text = element_text(face = "bold", size = 9),
+      legend.position = "right",
+      plot.margin = margin(t = 10, r = 15, b = 10, l = 10)
+    )
+  
+  print(go_enrich_plot)
+  
+  # Alto dinámico según número de términos y facetas, para que no se aplasten
+  n_terms     <- nrow(go_overlap_top)
+  n_sources   <- dplyr::n_distinct(go_overlap_top$go_source)
+  plot_height <- max(6, n_terms / n_sources * 0.35 * n_sources)
+  
+  ggsave("plot_GO_LR_wgcna_overlap_from_precomputed.pdf",
+         go_enrich_plot, width = 11, height = plot_height, limitsize = FALSE)
+  
+} else {
+  cat("Ninguno de los términos GO BP precomputados (WGCNA_24) contiene un gen del set de solape LR/módulo.\n")
+}
+```
+
+```{r}
+library(tidyverse)
+
+# Resolver conflictos de nombres entre tidyverse y otros paquetes cargados
+if (requireNamespace("conflicted", quietly = TRUE)) {
+  library(conflicted)
+  conflicts_prefer(dplyr::select, .quiet = TRUE)
+  conflicts_prefer(dplyr::filter, .quiet = TRUE)
+  conflicts_prefer(dplyr::mutate, .quiet = TRUE)
+  conflicts_prefer(dplyr::arrange, .quiet = TRUE)
+  conflicts_prefer(dplyr::count, .quiet = TRUE)
+  conflicts_prefer(base::intersect, .quiet = TRUE)
+}
+
+module_celltype_candidates <- hub_genes_table %>%
+  dplyr::filter(celltype %in% target_celltypes) %>%
+  dplyr::count(module, celltype, name = "n_hub_genes") %>%
+  dplyr::inner_join(age_association_summary, by = "module") %>%   # antes: module_trait_table + filter(fdr<0.05)
+  dplyr::filter(age_associated) %>%
+  dplyr::mutate(abs_correlation = abs(correlation)) %>%
+  dplyr::arrange(fdr_corr, fdr_traj, desc(n_hub_genes))
+
+cat("Candidatos (module x celltype) asociados a edad:\n")
+print(module_celltype_candidates)
+write.csv(module_celltype_candidates, "module_celltype_candidates_prelim.csv", row.names = FALSE)
+cat("Candidatos (version preliminar) exportados a module_celltype_candidates_prelim.csv\n")
+
+SELECTION_METRIC <- "fdr_corr"  # "fdr_corr" | "abs_correlation" | "fdr_traj" | "r_squared"
+
+top_hit <- switch(
+  SELECTION_METRIC,
+  fdr_corr        = module_celltype_candidates %>% dplyr::filter(sig_correlation) %>% dplyr::slice_min(fdr_corr, n = 1, with_ties = FALSE),
+  abs_correlation = module_celltype_candidates %>% dplyr::filter(sig_correlation) %>% dplyr::slice_max(abs_correlation, n = 1, with_ties = FALSE),
+  fdr_traj        = module_celltype_candidates %>% dplyr::filter(sig_trajectory) %>% dplyr::slice_min(fdr_traj, n = 1, with_ties = FALSE),
+  r_squared       = module_celltype_candidates %>% dplyr::filter(sig_trajectory) %>% dplyr::slice_max(r_squared, n = 1, with_ties = FALSE),
+  stop("SELECTION_METRIC debe ser 'fdr_corr', 'abs_correlation', 'fdr_traj' o 'r_squared'")
+)
+
+module_oi   <- top_hit$module
+receiver_oi <- top_hit$celltype
+```
+
+## Mechanistic hypothesis: age-associated module hub genes as the target gene set
+
+Instead of using MultiNicheNet's standard DE genes as the gene set of interest in the ligand activity analysis, here we use the **hub genes** (top kME) of a specific module, restricted to the cell type where that module's genes originate. This directly asks: *which ligands, from which candidate cell types, could be driving the co-expression program that WGCNA found in this cell type?* This whole section follows the classic NicheNet receiver-centric logic (Steps 2-3, 5-11, 13 of the [ngs101.com NicheNet tutorial](https://ngs101.com/how-to-analyze-single-cell-rna-seq-data-complete-beginners-guide-part-10-cell-cell-communication-analysis-using-nichenet/)), adapted so the receiver, the gene set of interest, and the receiver/sender cell types all come from WGCNA rather than from a fresh DE test.
+
+Note on `module_oi`/`receiver_oi` selection: WGCNA's modules are built from a **single combined network** of `gene_celltype` features (all `target_celltypes` mixed together), so a module-age correlation (`module_trait_table`) exists only **per module**, not per (module, celltype) -- there is no separate age-correlation value for "this module in Fibroblasts" vs. "this module in Myocytes". What legitimately varies by cell type is *which* cell types actually contributed hub genes to a given significant module (`hub_genes_table$celltype`). `module_celltype_candidates` below combines both pieces of information correctly: the module-level FDR/correlation from `module_trait_table`, crossed with every (module, celltype) combination that actually has hub genes, restricted to `target_celltypes` (so senders/receiver both stay within the same 4 cell types WGCNA and MultiNicheNet were restricted to).
+
+### Step 3 (WGCNA-adapted): real expressed genes per cell type
+
+The previous version of this section used `gene_celltype_module$gene` (the \~20K WGCNA age-dispersion HVGs) as a stand-in for "genes expressed in this cell type", for both the background gene universe and the sender ligand pool. That is too narrow: those \~20K genes are the ones WGCNA *selected* as highly age-variable, not the full set of genes actually expressed in each cell type, and using them as the ligand-activity background biases the corrected AUPR statistic (a smaller, non-random background changes what "enriched relative to background" means). Following Step 3 of the NicheNet tutorial, real expressed genes are computed here with `nichenetr::get_expressed_genes()` (\>= 10% of a cell type's cells, the same convention the tutorial uses) directly on `seurat_mnn` -- the exact same cells/cell types WGCNA and MultiNicheNet both use. WGCNA's gene set (`gene_celltype_module`) is still used for what it's actually meant for: defining `geneset_oi`, the hub genes themselves.
+
+```{r}
+library(tidyverse)
+
+# Resolver conflictos de nombres entre tidyverse y otros paquetes cargados
+if (requireNamespace("conflicted", quietly = TRUE)) {
+  library(conflicted)
+  conflicts_prefer(dplyr::select, .quiet = TRUE)
+  conflicts_prefer(dplyr::filter, .quiet = TRUE)
+  conflicts_prefer(dplyr::mutate, .quiet = TRUE)
+  conflicts_prefer(dplyr::arrange, .quiet = TRUE)
+  conflicts_prefer(dplyr::count, .quiet = TRUE)
+  conflicts_prefer(base::intersect, .quiet = TRUE)
+  conflicts_prefer(base::union, .quiet = TRUE)
+}
+
+EXPRESSION_PCT <- 0.10  # same convention as the NicheNet tutorial (>=10% of cells)
+
+expr_mat_mnn    <- Seurat::GetAssayData(seurat_mnn, assay = "RNA", layer = "counts")
+cell_idents_mnn <- seurat_mnn$final_celltype
+
+expressed_genes_by_celltype <- setNames(
+  lapply(target_celltypes, function(ct) {
+    nichenetr::get_expressed_genes(
+      celltype_oi    = ct,
+      object         = expr_mat_mnn,
+      celltype_annot = cell_idents_mnn,
+      pct            = EXPRESSION_PCT
+    )
+  }),
+  target_celltypes
+)
+
+cat("Real expressed genes per cell type (>=", EXPRESSION_PCT * 100, "% of cells):\n")
+print(vapply(expressed_genes_by_celltype, length, integer(1)))
+
+# Union across all 4 target_celltypes = the real "expressed_genes_sender" pool
+# used by the sender-agnostic ligand activity approach further below.
+expressed_genes_union <- Reduce(base::union, expressed_genes_by_celltype)
+cat("\nUnion of expressed genes across all target_celltypes:", length(expressed_genes_union), "\n")
+
+rm(expr_mat_mnn, cell_idents_mnn)
+```
+
+### Setup: module/celltype selection, gene set of interest, real background
+
+```{r hub-genes-ligand-activity-setup}
+# Build the (module x celltype) candidate table: module-level significance
+# from module_trait_table, crossed with which cell types actually have hub
+# genes in that module (from hub_genes_table), restricted to target_celltypes.
+module_celltype_candidates <- hub_genes_table %>%
+  filter(celltype %in% target_celltypes) %>%
+  count(module, celltype, name = "n_hub_genes") %>%
+  inner_join(
+    module_trait_table %>% dplyr::select(module, correlation, p_value, fdr),
+    by = "module"
+  ) %>%
+  filter(p_value < 0.05) %>%
+  mutate(abs_correlation = abs(correlation)) %>%
+  arrange(fdr, desc(n_hub_genes))
+
+cat("Significant (module x celltype) candidates (FDR < 0.05, restricted to target_celltypes):\n")
+print(module_celltype_candidates)
+write.csv(module_celltype_candidates, "module_celltype_candidates.csv", row.names = FALSE)
+cat("Candidatos exportados a module_celltype_candidates.csv\n")
+
+# Which criterion to rank candidates by, before picking the top one:
+#  - "fdr"              : most statistically confident module-age association (default)
+#  - "abs_correlation"   : strongest module-age effect size, regardless of FDR rank
+SELECTION_METRIC <- "fdr"  # change to "abs_correlation" to select by effect size instead
+
+top_hit <- switch(
+  SELECTION_METRIC,
+  fdr             = module_celltype_candidates %>% slice_min(fdr, n = 1, with_ties = FALSE),
+  abs_correlation = module_celltype_candidates %>% slice_max(abs_correlation, n = 1, with_ties = FALSE),
+  stop("SELECTION_METRIC must be 'fdr' or 'abs_correlation'")
+)
+# To force a specific module/celltype manually instead, uncomment and edit:
+# top_hit <- module_celltype_candidates %>% filter(module == "turquoise", celltype == "Fibroblasts")
+
+module_oi   <- top_hit$module
+receiver_oi <- top_hit$celltype
+
+cat("\nSelection metric:", SELECTION_METRIC, "\n")
+cat("Module of interest:", module_oi, "| Receiver cell type:", receiver_oi,
+    "| Module-age FDR:", signif(top_hit$fdr, 3),
+    "| Module-age correlation:", signif(top_hit$correlation, 3), "\n")
+
+# Hub genes of THAT module, selected specifically from THAT cell type
+# (the `celltype` column in hub_genes_table = origin celltype of the gene_celltype feature)
+geneset_oi <- hub_genes_table %>%
+  filter(module == module_oi, celltype == receiver_oi) %>%
+  pull(gene) %>%
+  unique()
+
+geneset_oi <- geneset_oi[geneset_oi %in% rownames(ligand_target_matrix)]
+cat("Hub genes used as the target gene set:", length(geneset_oi), "\n")
+
+# The tutorial recommends 50-500 genes for a stable ligand activity signal;
+# with a small module this can easily fall well below that. Warn loudly
+# rather than silently reporting an AUPR built on very few genes.
+MIN_GENESET_SIZE <- 20
+if (length(geneset_oi) < MIN_GENESET_SIZE) {
+  warning(
+    "geneset_oi has only ", length(geneset_oi), " genes (< ", MIN_GENESET_SIZE,
+    "). Ligand activity (AUPR) estimates from this few genes are unstable -- ",
+    "consider a larger/less strict module, a lower hub_percentile in WGCNA_24, ",
+    "or interpreting the ranking below qualitatively rather than quantitatively."
+  )
+}
+
+# REAL background: genes actually expressed in the receiver cell type
+# (>=10% of its cells, computed above), NOT just the WGCNA-selected HVGs --
+# this is the statistically correct background for predict_ligand_activities().
+background_expressed_genes <- expressed_genes_by_celltype[[receiver_oi]] %>%
+  intersect(rownames(ligand_target_matrix))
+
+cat("Real background expressed genes in", receiver_oi, ":", length(background_expressed_genes), "\n")
+cat("(for comparison, WGCNA-HVG-only background would have been:",
+    length(intersect(unique(gene_celltype_module$gene[gene_celltype_module$celltype == receiver_oi]),
+                      rownames(ligand_target_matrix))), ")\n")
+```
+
+### Ligand activity: sender-focused AND sender-agnostic (Step 5-7 style)
+
+Two candidate-ligand definitions are run and compared, as recommended by the NicheNet tutorial: **sender-focused** (ligand expressed in a specific `target_celltypes` sender AND its receptor expressed in the receiver -- iterated per sender cell type, as before) and **sender-agnostic** (any ligand in `lr_network` whose receptor is expressed in the receiver, regardless of which cell type expresses the ligand). Ligands that rank highly in *both* are the strongest candidates; ligands unique to the sender-agnostic list may come from cell types outside `target_celltypes` (i.e. cell types WGCNA/MultiNicheNet excluded) and should be interpreted with that caveat.
+
+```{r}
+run_candidate_plots <- function(module_oi, receiver_oi, verbose = TRUE) {
+  
+  geneset_oi <- hub_genes_table %>%
+    dplyr::filter(module == module_oi, celltype == receiver_oi) %>%
+    dplyr::pull(gene) %>%
+    unique()
+  geneset_oi <- geneset_oi[geneset_oi %in% rownames(ligand_target_matrix)]
+  
+  if (verbose) cat("\n===== Módulo:", module_oi, "| Receptor:", receiver_oi,
+                   "| Hub genes:", length(geneset_oi), "=====\n")
+  
+  if (length(geneset_oi) < MIN_GENESET_SIZE) {
+    warning("[", module_oi, "/", receiver_oi, "] geneset_oi tiene solo ", length(geneset_oi),
+            " genes (< ", MIN_GENESET_SIZE, "). Las estimaciones de ligand activity (AUPR) ",
+            "serán inestables.")
+  }
+  if (length(geneset_oi) < 5) {
+    cat("  -> Se salta", module_oi, "/", receiver_oi, ": geneset_oi demasiado pequeño (<5 genes).\n")
+    return(NULL)
+  }
+  
+  result <- tryCatch({
+    
+    background_expressed_genes <- expressed_genes_by_celltype[[receiver_oi]] %>%
+      intersect(rownames(ligand_target_matrix))
+    
+    sender_celltypes    <- base::setdiff(target_celltypes, receiver_oi)
+    expressed_receptors <- base::intersect(lr_network$receptor, background_expressed_genes)
+    
+    # --- Sender-focused: una corrida de ligand activity POR sender celltype ---
+    ligand_activities_by_sender <- purrr::map_dfr(sender_celltypes, function(sender_ct) {
+      sender_expressed_genes <- expressed_genes_by_celltype[[sender_ct]]
+      expressed_ligands <- base::intersect(lr_network$ligand, sender_expressed_genes)
+      
+      potential_ligands <- lr_network %>%
+        dplyr::filter(ligand %in% expressed_ligands, receptor %in% expressed_receptors) %>%
+        dplyr::pull(ligand) %>%
+        unique()
+      
+      if (length(potential_ligands) < 1) return(NULL)
+      
+      act <- tryCatch(
+        nichenetr::predict_ligand_activities(
+          geneset                    = geneset_oi,
+          background_expressed_genes = background_expressed_genes,
+          ligand_target_matrix       = ligand_target_matrix,
+          potential_ligands          = potential_ligands
+        ),
+        error = function(e) {
+          message("  [", module_oi, "/", receiver_oi, "] Sender '", sender_ct,
+                  "': ligand activity falló (", conditionMessage(e), ")")
+          NULL
+        }
+      )
+      if (is.null(act)) return(NULL)
+      
+      act$sender   <- sender_ct
+      act$approach <- "sender-focused"
+      act
+    })
+    
+    if (nrow(ligand_activities_by_sender) == 0 || !"aupr_corrected" %in% names(ligand_activities_by_sender)) {
+      cat("  -> Ningún sender produjo ligand activities válidas para", module_oi, "/", receiver_oi,
+          "-- se salta.\n")
+      return(NULL)
+    }
+    ligand_activities_by_sender <- ligand_activities_by_sender %>%
+      dplyr::arrange(desc(aupr_corrected))
+    
+    # --- Sender-agnostic: UNA corrida, cualquier ligando con receptor expresado en el receptor ---
+    potential_ligands_agnostic <- lr_network %>%
+      dplyr::filter(ligand %in% expressed_genes_union, receptor %in% expressed_receptors) %>%
+      dplyr::pull(ligand) %>%
+      unique()
+    
+    ligand_activities_agnostic <- tryCatch(
+      nichenetr::predict_ligand_activities(
+        geneset                    = geneset_oi,
+        background_expressed_genes = background_expressed_genes,
+        ligand_target_matrix       = ligand_target_matrix,
+        potential_ligands          = potential_ligands_agnostic
+      ),
+      error = function(e) {
+        message("  [", module_oi, "/", receiver_oi, "] Sender-agnostic ligand activity falló (",
+                conditionMessage(e), ")")
+        NULL
+      }
+    )
+    if (!is.null(ligand_activities_agnostic)) {
+      ligand_activities_agnostic <- ligand_activities_agnostic %>%
+        dplyr::arrange(desc(aupr_corrected)) %>%
+        dplyr::mutate(sender = NA_character_, approach = "sender-agnostic")
+    }
+    
+    write.csv(
+      ligand_activities_by_sender,
+      paste0("ligand_activity_hubgenes_", module_oi, "_", receiver_oi, "_sender_focused.csv"),
+      row.names = FALSE
+    )
+    if (!is.null(ligand_activities_agnostic)) {
+      write.csv(
+        ligand_activities_agnostic,
+        paste0("ligand_activity_hubgenes_", module_oi, "_", receiver_oi, "_sender_agnostic.csv"),
+        row.names = FALSE
+      )
+    }
+    
+    top_ligands_focused_set <- ligand_activities_by_sender %>%
+      dplyr::slice_max(aupr_corrected, n = TOP_N_LIGANDS, with_ties = FALSE) %>%
+      dplyr::pull(test_ligand) %>% unique()
+    
+    top_ligands_agnostic_set <- if (!is.null(ligand_activities_agnostic)) {
+      ligand_activities_agnostic %>%
+        dplyr::slice_max(aupr_corrected, n = TOP_N_LIGANDS, with_ties = FALSE) %>%
+        dplyr::pull(test_ligand) %>% unique()
+    } else character(0)
+    
+    best_upstream_ligands <- base::union(top_ligands_focused_set, top_ligands_agnostic_set)
+    shared_ligands         <- base::intersect(top_ligands_focused_set, top_ligands_agnostic_set)
+    
+    # --- Plot 1: actividad de ligandos por sender ---
+    top_ligands_plot <- ligand_activities_by_sender %>%
+      dplyr::group_by(sender) %>%
+      dplyr::slice_max(aupr_corrected, n = 5, with_ties = FALSE) %>%
+      dplyr::ungroup() %>%
+      dplyr::mutate(is_shared = test_ligand %in% shared_ligands)
+    
+    p_ligand_activity <- ggplot(top_ligands_plot,
+                                aes(x = reorder(test_ligand, aupr_corrected), y = aupr_corrected,
+                                    fill = sender, alpha = is_shared)) +
+      geom_col() +
+      coord_flip() +
+      facet_wrap(~ sender, scales = "free_y") +
+      scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.55), guide = "none") +
+      labs(
+        x = "Ligand", y = "Predicted activity (corrected AUPR)",
+        title = paste0("Candidate ligands by sender celltype -> hub genes of module ",
+                       module_oi, " in ", receiver_oi),
+        subtitle = "Target gene set = module hub genes (top kME); solid bars = also top-ranked sender-agnostic"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "none")
+    
+    if (verbose) print(p_ligand_activity)
+    ggsave(
+      paste0("plot_ligand_activity_hubgenes_", module_oi, "_", receiver_oi, ".pdf"),
+      p_ligand_activity, width = 10, height = 7
+    )
+    
+    # --- Plot 2: heatmap ligando-target ---
+    active_ligand_target_links_df <- best_upstream_ligands %>%
+      lapply(get_weighted_ligand_target_links,
+             geneset              = geneset_oi,
+             ligand_target_matrix = ligand_target_matrix,
+             n                    = 100) %>%
+      bind_rows() %>%
+      tidyr::drop_na()
+    
+    p_ligand_target_heatmap <- NULL
+    if (nrow(active_ligand_target_links_df) > 0) {
+      active_ligand_target_links <- prepare_ligand_target_visualization(
+        ligand_target_df     = active_ligand_target_links_df,
+        ligand_target_matrix = ligand_target_matrix,
+        cutoff               = 1/3
+      )
+      
+      order_ligands <- intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+      order_targets <- active_ligand_target_links_df$target %>%
+        unique() %>%
+        intersect(rownames(active_ligand_target_links))
+      
+      vis_ligand_target <- active_ligand_target_links[order_targets, order_ligands, drop = FALSE]
+      
+      p_ligand_target_heatmap <- vis_ligand_target %>%
+        make_heatmap_ggplot(
+          y_name       = paste0("Hub genes of module ", module_oi, " (", receiver_oi, ")"),
+          x_name       = "Prioritized ligands (sender-focused U sender-agnostic)",
+          color        = "purple",
+          legend_title = "Regulatory\npotential"
+        ) +
+        theme(axis.text.x = element_text(face = "italic", angle = 90, hjust = 1))
+      
+      if (verbose) print(p_ligand_target_heatmap)
+      ggsave(
+        paste0("plot_ligand_target_heatmap_", module_oi, "_", receiver_oi, ".pdf"),
+        p_ligand_target_heatmap, width = 10, height = 8
+      )
+    } else {
+      cat("  -> Ningún link ligando-target pasó el cutoff para", module_oi, "/", receiver_oi,
+          "-- se salta el heatmap.\n")
+    }
+    
+    # --- Ligando top único + tabla de sus genes target ---
+    top_ligand <- dplyr::bind_rows(
+      ligand_activities_by_sender %>% dplyr::select(test_ligand, aupr_corrected),
+      if (!is.null(ligand_activities_agnostic)) {
+        ligand_activities_agnostic %>% dplyr::select(test_ligand, aupr_corrected)
+      } else NULL
+    ) %>%
+      dplyr::arrange(desc(aupr_corrected)) %>%
+      dplyr::slice(1) %>%
+      dplyr::pull(test_ligand)
+    
+    active_ligand_targets <- get_weighted_ligand_target_links(
+      ligand               = top_ligand,
+      geneset              = geneset_oi,
+      ligand_target_matrix = ligand_target_matrix,
+      n                    = 100
+    )
+    
+    # --- Plot 3: heatmap ligando-receptor ---
+    local_lr_network <- lr_network
+    if (!"from" %in% colnames(local_lr_network) && "ligand" %in% colnames(local_lr_network)) {
+      local_lr_network <- local_lr_network %>% dplyr::rename(from = ligand, to = receptor)
+    }
+    
+    ligand_receptor_links_df <- get_weighted_ligand_receptor_links(
+      best_upstream_ligands,
+      expressed_receptors,
+      local_lr_network,
+      weighted_networks$lr_sig
+    )
+    
+    p_ligand_receptor_heatmap <- NULL
+    if (nrow(ligand_receptor_links_df) > 0) {
+      vis_ligand_receptor_network <- prepare_ligand_receptor_visualization(
+        ligand_receptor_links_df,
+        best_upstream_ligands,
+        order_hclust = "both"
+      )
+      
+      p_ligand_receptor_heatmap <- t(vis_ligand_receptor_network) %>%
+        make_heatmap_ggplot(
+          y_name       = "Ligands",
+          x_name       = paste0("Receptors expressed in receiver (", receiver_oi, ")"),
+          color        = "mediumvioletred",
+          legend_title = "Prior interaction\npotential"
+        ) +
+        theme(axis.text.x = element_text(face = "italic", angle = 90, hjust = 1))
+      
+      if (verbose) print(p_ligand_receptor_heatmap)
+      ggsave(
+        paste0("plot_ligand_receptor_heatmap_", module_oi, "_", receiver_oi, ".pdf"),
+        p_ligand_receptor_heatmap, width = 9, height = 7
+      )
+      
+      write.csv(
+        ligand_receptor_links_df,
+        paste0("ligand_receptor_links_", module_oi, "_", receiver_oi, ".csv"),
+        row.names = FALSE
+      )
+    } else {
+      cat("  -> No se encontraron links ligando-receptor para", module_oi, "/", receiver_oi, ".\n")
+    }
+    
+    # --- Plot 4: signaling path (ligando -> receptor -> TF -> target hub gene) ---
+    p_signaling_path  <- NULL
+    sig_path_combined <- NULL
+    if (nrow(active_ligand_targets) > 0) {
+      top_target_for_path <- active_ligand_targets %>%
+        dplyr::arrange(desc(weight)) %>%
+        dplyr::slice(1) %>%
+        dplyr::pull(target)
+      
+      sig_path <- tryCatch(
+        get_ligand_signaling_path(
+          ligand_tf_matrix  = ligand_tf_matrix,
+          ligands_all       = top_ligand,
+          targets_all       = top_target_for_path,
+          top_n_regulators  = 4,
+          weighted_networks = weighted_networks,
+          minmax_scaling    = TRUE
+        ),
+        error = function(e) {
+          message("  [", module_oi, "/", receiver_oi, "] Signaling path inference falló (",
+                  conditionMessage(e), ")")
+          NULL
+        }
+      )
+      
+      if (!is.null(sig_path) && nrow(sig_path$sig) + nrow(sig_path$gr) > 0) {
+        sig_path_combined <- dplyr::bind_rows(sig_path$sig, sig_path$gr)
+        sig_graph <- igraph::graph_from_data_frame(sig_path_combined, directed = TRUE)
+        
+        p_signaling_path <- ggraph::ggraph(sig_graph, layout = "kk") +
+          ggraph::geom_edge_link(
+            aes(edge_width = weight, edge_alpha = weight),
+            arrow   = grid::arrow(length = unit(3, "mm"), type = "closed"),
+            end_cap = ggraph::circle(3, "mm"),
+            color   = "grey50"
+          ) +
+          ggraph::geom_node_point(size = 5, color = "steelblue") +
+          ggraph::geom_node_text(aes(label = name), repel = TRUE, size = 3) +
+          ggraph::scale_edge_width(range = c(0.5, 2)) +
+          theme_void() +
+          labs(title = paste("Signaling path:", top_ligand, "->", top_target_for_path),
+               subtitle = paste0("Module ", module_oi, " hub gene, receiver = ", receiver_oi))
+        
+        if (verbose) print(p_signaling_path)
+        ggsave(
+          paste0("plot_signaling_path_", module_oi, "_", receiver_oi, "_",
+                 top_ligand, "_", top_target_for_path, ".pdf"),
+          p_signaling_path, width = 8, height = 6
+        )
+      } else {
+        cat("  -> No se pudo inferir signaling path para", module_oi, "/", receiver_oi,
+            "(", top_ligand, "->", top_target_for_path, ").\n")
+      }
+    } else {
+      cat("  -> active_ligand_targets vacío para", module_oi, "/", receiver_oi,
+          "-- no hay target para trazar signaling path.\n")
+    }
+    
+    list(
+      module_oi                   = module_oi,
+      receiver_oi                 = receiver_oi,
+      geneset_oi                  = geneset_oi,
+      background_expressed_genes  = background_expressed_genes,
+      ligand_activities_by_sender = ligand_activities_by_sender,
+      ligand_activities_agnostic  = ligand_activities_agnostic,
+      best_upstream_ligands       = best_upstream_ligands,
+      shared_ligands              = shared_ligands,
+      top_ligand                  = top_ligand,
+      active_ligand_targets       = active_ligand_targets,
+      sig_path_combined           = sig_path_combined,
+      p_ligand_activity           = p_ligand_activity,
+      p_ligand_target_heatmap     = p_ligand_target_heatmap,
+      p_ligand_receptor_heatmap   = p_ligand_receptor_heatmap,
+      p_signaling_path            = p_signaling_path
+    )
+    
+  }, error = function(e) {
+    message("  [", module_oi, "/", receiver_oi,
+            "] run_candidate_plots fallo con un error no controlado: ", conditionMessage(e))
+    NULL
+  })
+  
+  return(result)
+}
+```
+
+### Candidato principal (`top_hit`)
+
+Se corre primero para el candidato principal seleccionado por `SELECTION_METRIC`; sus resultados se asignan a las variables globales `ligand_activities_by_sender` / `ligand_activities_agnostic` que usan las secciones de más abajo (golden table, heatmap general, export multi-hoja), igual que en la versión anterior.
+
+```{r hub-genes-top-hit-run, fig.width=10, fig.height=7}
+TOP_N_LIGANDS<-10
+top_hit_result <- run_candidate_plots(module_oi, receiver_oi)
+
+if (is.null(top_hit_result)) {
+  stop("El candidato top_hit (", module_oi, "/", receiver_oi,
+       ") no produjo resultados válidos -- revisa geneset_oi/background.")
+}
+
+geneset_oi                  <- top_hit_result$geneset_oi
+background_expressed_genes  <- top_hit_result$background_expressed_genes
+ligand_activities_by_sender <- top_hit_result$ligand_activities_by_sender
+ligand_activities_agnostic  <- top_hit_result$ligand_activities_agnostic
+best_upstream_ligands       <- top_hit_result$best_upstream_ligands
+shared_ligands               <- top_hit_result$shared_ligands
+top_ligand                  <- top_hit_result$top_ligand
+active_ligand_targets       <- top_hit_result$active_ligand_targets
+
+cat("\nCandidatos ligandos top (sender-focused, cualquier sender celltype) para el programa hub del módulo",
+    module_oi, "en", receiver_oi, ":\n")
+print(head(ligand_activities_by_sender, 15))
+
+if (!is.null(ligand_activities_agnostic)) {
+  cat("\nCandidatos ligandos top (sender-agnostic) para el mismo programa hub:\n")
+  print(head(ligand_activities_agnostic, 15))
+}
+
+cat("\nLigandos compartidos por AMBOS enfoques (candidatos más fuertes):\n")
+print(shared_ligands)
+```
+
+### Todos los candidatos: mismos gráficos, en loop
+
+Se repite exactamente el mismo bloque de análisis y gráficos de arriba (actividad de ligandos por sender, heatmap ligando-target, heatmap ligando-receptor, signaling path) para **cada fila** de `module_celltype_candidates` -- no solo para `top_hit`. Cada candidato genera su propio set de PDFs/CSVs (ya nombrados por `module_oi`/`receiver_oi`, así que no se pisan entre sí). Los resultados de todos los candidatos quedan además en `all_candidates_results` (lista con un elemento por module x celltype) para inspección posterior en R sin tener que releer los CSVs.
+
+```{r hub-genes-all-candidates-loop, fig.width=10, fig.height=7}
+cat("Candidatos a procesar en el loop:", nrow(module_celltype_candidates), "\n")
+
+all_candidates_results <- purrr::map2(
+  module_celltype_candidates$module,
+  module_celltype_candidates$celltype,
+  run_candidate_plots
+)
+names(all_candidates_results) <- paste(
+  module_celltype_candidates$module, module_celltype_candidates$celltype, sep = "_"
+)
+
+# Candidatos que se saltaron (geneset_oi < 5 genes o ligand activity fallida en todos los senders)
+skipped_candidates <- names(all_candidates_results)[vapply(all_candidates_results, is.null, logical(1))]
+if (length(skipped_candidates) > 0) {
+  cat("\nCandidatos sin resultados (geneset_oi < 5 genes o sin ligand activities válidas):\n")
+  print(skipped_candidates)
+}
+
+# Tabla resumen: mejor ligando y su AUPR corregido por cada candidato procesado
+all_candidates_results_ok <- Filter(Negate(is.null), all_candidates_results)
+
+candidates_summary <- purrr::map_dfr(all_candidates_results_ok, function(res) {
+  tibble::tibble(
+    module            = res$module_oi,
+    celltype          = res$receiver_oi,
+    n_hub_genes       = length(res$geneset_oi),
+    n_best_upstream   = length(res$best_upstream_ligands),
+    n_shared_ligands  = length(res$shared_ligands),
+    top_ligand        = res$top_ligand,
+    top_ligand_aupr   = max(
+      dplyr::bind_rows(
+        res$ligand_activities_by_sender %>% dplyr::select(test_ligand, aupr_corrected),
+        if (!is.null(res$ligand_activities_agnostic)) {
+          res$ligand_activities_agnostic %>% dplyr::select(test_ligand, aupr_corrected)
+        } else NULL
+      )$aupr_corrected,
+      na.rm = TRUE
+    )
+  )
+})
+
+write.csv(candidates_summary, "all_candidates_summary.csv", row.names = FALSE)
+
+cat("\nResumen de todos los candidatos procesados (guardado en all_candidates_summary.csv):\n")
+print(candidates_summary)
+```
+
+## Summary & Integration: Golden Table, Heatmaps, and Multi-sheet Export
+
+### 1. Build the consolidated "golden table"
+
+The golden table is a single denormalized data frame where every row is a unique ligand-receptor pair, enriched with: the contrasts where it was prioritized, module membership, SASP annotation, and top predicted ligand activity across all sender-celltype combinations. This is the table to use for filtering, sorting, and publication-quality figures.
+
+```{r golden-table-build}
+# Start with all prioritized LR pairs
+golden_table <- multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  distinct(sender, receiver, ligand, receptor)
+
+# Which contrasts contain each LR pair (pivot to comma-separated string)
+lr_per_contrast <- multinichenet_output$prioritization_tables$group_prioritization_tbl %>%
+  distinct(contrast, sender, receiver, ligand, receptor) %>%
+  group_by(sender, receiver, ligand, receptor) %>%
+  summarise(contrasts_active = paste(sort(unique(contrast)), collapse = "; "),
+            n_contrasts = n_distinct(contrast), .groups = "drop")
+
+golden_table <- golden_table %>%
+  left_join(lr_per_contrast, by = c("sender", "receiver", "ligand", "receptor"))
+
+# WGCNA module membership: ligand in sender cell type?
+# ============================================================
+# {r golden-table-build}  -- ligand_modules / receptor_modules
+# ============================================================
+ligand_modules <- gene_celltype_module %>%
+  filter(module %in% age_associated_modules) %>%   # antes: significant_modules
+  group_by(gene, celltype) %>%
+  summarise(module = paste(sort(unique(module)), collapse = "; "), .groups = "drop") %>%
+  rename(ligand = gene, sender = celltype, ligand_modules = module)
+
+receptor_modules <- gene_celltype_module %>%
+  filter(module %in% age_associated_modules) %>%   # antes: significant_modules
+  group_by(gene, celltype) %>%
+  summarise(module = paste(sort(unique(module)), collapse = "; "), .groups = "drop") %>%
+  rename(receptor = gene, receiver = celltype, receptor_modules = module)
+
+
+
+# Top ligand activity for this LR pair (across all senders/receivers)
+if (nrow(ligand_activities_by_sender) > 0) {
+  top_ligand_activity <- ligand_activities_by_sender %>%
+    group_by(test_ligand) %>%
+    slice_max(aupr_corrected, n = 1, with_ties = FALSE) %>%
+    rename(ligand = test_ligand, max_aupr_corrected = aupr_corrected, aupr_sender_ct = sender) %>%
+    dplyr::select(ligand, max_aupr_corrected, aupr_sender_ct)
+
+  golden_table <- golden_table %>%
+    left_join(top_ligand_activity, by = c("ligand"))
+}
+
+# Sort by activity (if available) or by n_contrasts
+golden_table <- golden_table %>%
+  arrange(desc(max_aupr_corrected %||% 0), desc(n_contrasts))
+
+cat("Golden table built:", nrow(golden_table), "unique LR pairs\n")
+print(head(golden_table, 10))
+
+write.csv(golden_table, "golden_table_LR_pairs.csv", row.names = FALSE)
+```
+
+### 2. Ligand activity heatmap (all ligands × sender cell types)
+
+A heatmap showing which ligands are active (high aupr_corrected) in which sender cell types. Restricted to top 30 ligands for readability.
+
+```{r ligand-activity-heatmap, fig.width=12, fig.height=8}
+heatmap_data <- ligand_activities_by_sender %>%
+  dplyr::select(test_ligand, sender, aupr_corrected) %>%
+  group_by(test_ligand, sender) %>%
+  slice_max(aupr_corrected, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(aupr_corrected)) %>%
+  slice_head(n = 30)
+
+p_ligand_heatmap <- ggplot(heatmap_data, aes(x = sender, y = reorder(test_ligand, aupr_corrected),
+                                              fill = aupr_corrected)) +
+  geom_tile(color = "white", size = 0.5) +
+  scale_fill_gradient(low = "#fee5d9", high = "#a50f15") +
+  labs(
+    x = "Sender cell type",
+    y = "Ligand",
+    fill = "AUPR (corrected)",
+    title = "Ligand Activity Heatmap",
+    subtitle = "Top 30 ligands by max activity; color = predicted activity for receptor target genes"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_ligand_heatmap)
+ggsave("plot_ligand_activity_heatmap_top30.pdf", p_ligand_heatmap, width = 12, height = 8)
+```
+
+### 3. Network plot of cell-cell communication (interactive visNetwork)
+
+An interactive network where nodes are cell types and edges represent LR pairs. Edge width = number of distinct ligand-receptor pairs; edge color reflects the proportion of pairs overlapping age-associated WGCNA modules.
+
+```{r network-visualization, fig.width=9, fig.height=7}
+library(tidyverse)
+library(visNetwork)
+
+network_summary <- golden_table %>%
+  group_by(sender, receiver) %>%
+  summarise(
+    n_pairs       = n(),
+    n_wgcna       = sum(!is.na(ligand_modules) | !is.na(receptor_modules)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Evitamos división por cero o NaNs asegurando que n_pairs > 0
+    pct_wgcna = if_else(n_pairs > 0, 100 * n_wgcna / n_pairs, 0),
+    # Reemplazamos cualquier NA residual por 0
+    pct_wgcna = replace_na(pct_wgcna, 0)
+  )
+
+network_nodes <- unique(c(network_summary$sender, network_summary$receiver))
+
+nodes_df <- data.frame(
+  id    = network_nodes,
+  label = network_nodes,
+  title = network_nodes,
+  color = "#2c7fb8",
+  size  = 30
+)
+
+# Creamos el gradiente de forma segura controlando el rango de colores
+edge_colors <- colorRamp(c("lightgrey", "#2ca25f"))(pmin(pmax(network_summary$pct_wgcna / 100, 0), 1))
+
+# Manejo seguro por si quedara algún elemento nulo (asegurando dimensiones de matriz)
+if (is.matrix(edge_colors)) {
+  edge_colors[is.na(edge_colors)] <- 200 
+  edge_colors_hex <- apply(edge_colors, 1, function(x) rgb(x[1], x[2], x[3], maxColorValue = 255))
+} else {
+  edge_colors_hex <- rep("#d3d3d3", nrow(network_summary))
+}
+
+# Construcción de los bordes (edges_df) requeridos por visNetwork a partir del resumen
+edges_df <- data.frame(
+  from  = network_summary$sender,
+  to    = network_summary$receiver,
+  value = network_summary$n_pairs,
+  color = edge_colors_hex,
+  title = paste0("Pairs: ", network_summary$n_pairs, "<br>WGCNA %: ", round(network_summary$pct_wgcna, 1), "%")
+)
+
+p_network <- visNetwork(nodes_df, edges_df, directed = TRUE, physics = TRUE) %>%
+  visLayout(randomSeed = 42) %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visPhysics(enabled = TRUE, stabilization = list(iterations = 200))
+
+visSave(p_network, "network_LR_celltype_interactive.html")
+cat("Interactive network saved to: network_LR_celltype_interactive.html\n")
+```
+
+### 4. Session info for reproducibility
+
+```{r session-info}
+cat("\n=== R Session Info ===\n")
+session_info <- capture.output(sessionInfo())
+writeLines(session_info, "session_info.txt")
+print(sessionInfo())
+```
+
+### 5. Export all key tables to multi-sheet Excel workbook
+
+```{r excel-export}
+# Clean up list columns for Excel compatibility
+golden_table_export <- golden_table %>% 
+  mutate(across(where(is.list), ~ as.character(.)))
+
+# Build workbook with multiple sheets
+wb <- createWorkbook()
+
+sheet_data <- list(
+  "Golden_Table"              = golden_table_export,
+  "LR_WGCNA_Overlap"          = lr_prioritized_annotated, 
+  "GO_Overlap_Terms"          = go_overlap_combined %>%
+    dplyr::select(any_of(c("Description", "module", "p.adjust", "n_overlap_genes", "go_source"))),
+  "Ligand_Activity"           = ligand_activities_by_sender %>%
+    dplyr::select(any_of(c("test_ligand", "sender", "aupr", "aupr_corrected", "p_value", "p.value"))),
+  "Ligand_Activity_Agnostic"  = if (!is.null(ligand_activities_agnostic)) {
+    ligand_activities_agnostic %>% dplyr::select(any_of(c("test_ligand", "aupr", "aupr_corrected", "p_value", "p.value")))
+  } else data.frame(),
+  "Ligand_Receptor_Links"     = ligand_receptor_links_df,
+  "Ligand_Activity_Robustness" = robustness_results %>%
+    dplyr::select(any_of(c("test_ligand", "sender", "receiver", "module", "aupr_corrected")))
+)
+
+# Add sheets with formatting
+for (sheet_name in names(sheet_data)) {
+  addWorksheet(wb, sheet_name)
+
+  if (is.null(sheet_data[[sheet_name]]) || ncol(sheet_data[[sheet_name]]) == 0) {
+    writeData(wb, sheet = sheet_name, x = "No data available for this section")
+    next
+  }
+
+  writeData(wb, sheet = sheet_name, x = sheet_data[[sheet_name]])
+
+  # Style headers
+  headerStyle <- createStyle(
+    fgFill = "#2c7fb8", fontColour = "white", textDecoration = "bold", halign = "center"
+  )
+  addStyle(wb, sheet = sheet_name, style = headerStyle, rows = 1,
+           cols = 1:ncol(sheet_data[[sheet_name]]))
+  setColWidths(wb, sheet = sheet_name, cols = 1:ncol(sheet_data[[sheet_name]]), widths = "auto")
+  freezePane(wb, sheet = sheet_name, firstRow = TRUE)
+}
+
+saveWorkbook(wb, "multinichenet_wgcna_integration_tables.xlsx", overwrite = TRUE)
+cat("Multi-sheet Excel export saved to: multinichenet_wgcna_integration_tables.xlsx\n")
+```
