@@ -1,4 +1,4 @@
-# Aging Mouse Heart -- Multi-Omic Single-Cell Analysis
+# Aging Mouse Heart -- Single-Cell Analysis
 
 Co-expression, cell-cell communication, and gene regulatory network analysis of aging in the
 mouse heart, using single-cell RNA-seq data from *Tabula Muris Senis* (FACS + droplet).
